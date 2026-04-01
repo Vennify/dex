@@ -79,6 +79,9 @@ enum Commands {
         /// Max results
         #[arg(long, default_value = "10")]
         limit: usize,
+        /// Show N surrounding messages for context
+        #[arg(long)]
+        context: Option<usize>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -118,6 +121,29 @@ enum Commands {
         #[arg(long)]
         commands: bool,
     },
+    /// Show file history across all sessions
+    File {
+        /// File path (substring match)
+        path: String,
+        /// Show only edits
+        #[arg(long)]
+        edits: bool,
+        /// Show only reads
+        #[arg(long)]
+        reads: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show statistics
+    Stats {
+        /// Filter by project
+        #[arg(long)]
+        project: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Search mode derived from CLI flags.
@@ -152,7 +178,8 @@ fn main() {
             after,
             before,
             limit,
-            json: _,
+            context,
+            json,
         } => {
             let query_str = match query_str {
                 Some(q) => q,
@@ -177,7 +204,7 @@ fn main() {
             } else {
                 SearchMode::Hybrid
             };
-            cmd_search(&config, &query_str, &filters, limit, mode);
+            cmd_search(&config, &query_str, &filters, limit, mode, context, json);
         }
         Commands::Sessions { project, after, sort } => {
             cmd_sessions(&config, project.as_deref(), after.as_deref(), &sort);
@@ -207,6 +234,12 @@ fn main() {
                 ShowFilter::All
             };
             cmd_show(&config, &session_id, filter);
+        }
+        Commands::File { path, edits, reads, json } => {
+            cmd_file(&config, &path, edits, reads, json);
+        }
+        Commands::Stats { project, json } => {
+            cmd_stats(&config, project.as_deref(), json);
         }
     }
 }
@@ -305,7 +338,7 @@ fn cmd_index(config: &Config, full: bool, project_filter: Option<&str>, status: 
     let mut total_docs = 0u64;
     let mut total_vectors = 0u64;
 
-    for (session_idx, session_file) in to_index.iter().enumerate() {
+    for (_session_idx, session_file) in to_index.iter().enumerate() {
         pb.set_message(format!(
             "| {}docs {}vecs",
             total_docs, total_vectors,
@@ -404,7 +437,15 @@ fn load_embedder_and_store(config: &Config) -> Result<(Embedder, VectorStore), S
     Ok((embedder, store))
 }
 
-fn cmd_search(config: &Config, query_str: &str, filters: &SearchFilters, limit: usize, mode: SearchMode) {
+fn cmd_search(
+    config: &Config,
+    query_str: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    mode: SearchMode,
+    context: Option<usize>,
+    json_output: bool,
+) {
     let schema = tantivy_index::build_schema();
     let index = match tantivy_index::open_or_create(&config.tantivy_dir, &schema) {
         Ok(idx) => idx,
@@ -414,71 +455,49 @@ fn cmd_search(config: &Config, query_str: &str, filters: &SearchFilters, limit: 
         }
     };
 
-    match mode {
+    let results = match mode {
         SearchMode::Exact => {
-            match text::search(&index, &schema, query_str, filters, limit) {
-                Ok(results) => format::print_search_results(&results),
-                Err(e) => {
-                    eprintln!("Search error: {e}");
-                    std::process::exit(1);
-                }
-            }
+            text::search(&index, &schema, query_str, filters, limit)
+                .unwrap_or_else(|e| { eprintln!("Search error: {e}"); std::process::exit(1); })
         }
         SearchMode::Semantic => {
             let (mut embedder, store) = match load_embedder_and_store(config) {
                 Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("Error loading embedder: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => { eprintln!("Error loading embedder: {e}"); std::process::exit(1); }
             };
-            match query::semantic::search(&mut embedder, &store, query_str, limit) {
-                Ok(results) => {
-                    // Look up full results from tantivy for display
-                    let reader = index.reader().expect("reader");
-                    let searcher = reader.searcher();
-                    let mut display_results = Vec::new();
-                    for sem in &results {
-                        if let Some(r) = lookup_by_message_id(&index, &schema, &searcher, &sem.message_id) {
-                            display_results.push(query::text::SearchResult {
-                                score: 1.0 - sem.distance, // cosine distance → similarity
-                                ..r
-                            });
-                        }
-                    }
-                    format::print_search_results(&display_results);
-                }
-                Err(e) => {
-                    eprintln!("Semantic search error: {e}");
-                    std::process::exit(1);
-                }
-            }
+            let sem_results = query::semantic::search(&mut embedder, &store, query_str, limit)
+                .unwrap_or_else(|e| { eprintln!("Semantic search error: {e}"); std::process::exit(1); });
+            let reader = index.reader().expect("reader");
+            let searcher = reader.searcher();
+            sem_results.into_iter().filter_map(|sem| {
+                lookup_by_message_id(&index, &schema, &searcher, &sem.message_id).map(|r| {
+                    query::text::SearchResult { score: 1.0 - sem.distance, ..r }
+                })
+            }).collect()
         }
         SearchMode::Hybrid => {
-            // Try to load embedder; fall back to exact if unavailable
             match load_embedder_and_store(config) {
                 Ok((mut embedder, store)) => {
-                    match query::hybrid::search(&index, &schema, &mut embedder, &store, query_str, filters, limit) {
-                        Ok(results) => format::print_search_results(&results),
-                        Err(e) => {
-                            eprintln!("Hybrid search error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
+                    query::hybrid::search(&index, &schema, &mut embedder, &store, query_str, filters, limit)
+                        .unwrap_or_else(|e| { eprintln!("Hybrid search error: {e}"); std::process::exit(1); })
                 }
                 Err(_) => {
-                    // Fall back to text-only search
                     eprintln!("Note: no vector index found, falling back to text search.");
-                    match text::search(&index, &schema, query_str, filters, limit) {
-                        Ok(results) => format::print_search_results(&results),
-                        Err(e) => {
-                            eprintln!("Search error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
+                    text::search(&index, &schema, query_str, filters, limit)
+                        .unwrap_or_else(|e| { eprintln!("Search error: {e}"); std::process::exit(1); })
                 }
             }
         }
+    };
+
+    if json_output {
+        format::print_search_results_json(&results);
+    } else if let Some(ctx_n) = context {
+        // Show surrounding messages for each result
+        let all_sessions = session::discover_sessions(&config.claude_projects_dir);
+        format::print_search_results_with_context(&results, &all_sessions, ctx_n);
+    } else {
+        format::print_search_results(&results);
     }
 }
 
@@ -614,5 +633,122 @@ fn cmd_show(config: &Config, session_id_prefix: &str, filter: ShowFilter) {
             }
             std::process::exit(1);
         }
+    }
+}
+
+fn cmd_file(config: &Config, path_query: &str, edits_only: bool, reads_only: bool, json_output: bool) {
+    let all_sessions = session::discover_sessions(&config.claude_projects_dir);
+
+    let mut file_records: Vec<format::FileHistoryItem> = Vec::new();
+
+    for sf in &all_sessions {
+        let records = session::parse_session(sf);
+        for record in &records {
+            let file_path = match &record.file_path {
+                Some(fp) => fp,
+                None => continue,
+            };
+            if !file_path.contains(path_query) {
+                continue;
+            }
+            // Apply edits/reads filter
+            if edits_only && record.tool_name.as_deref() != Some("Edit") {
+                continue;
+            }
+            if reads_only && record.tool_name.as_deref() != Some("Read") {
+                continue;
+            }
+            file_records.push(format::FileHistoryItem {
+                session_id: record.session_id.clone(),
+                project: record.project.clone(),
+                tool_name: record.tool_name.clone().unwrap_or_default(),
+                file_path: file_path.clone(),
+                content: record.content.clone(),
+                timestamp: record.timestamp,
+            });
+        }
+    }
+
+    if json_output {
+        format::print_file_history_json(&file_records);
+    } else {
+        format::print_file_history(&file_records);
+    }
+}
+
+fn cmd_stats(config: &Config, project_filter: Option<&str>, json_output: bool) {
+    let all_sessions = session::discover_sessions(&config.claude_projects_dir);
+    let meta_map = metadata::load_all_session_meta(&config.claude_session_meta_dir);
+
+    let sessions: Vec<_> = all_sessions
+        .into_iter()
+        .filter(|s| {
+            if let Some(pf) = project_filter {
+                s.project.contains(pf)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let mut total_input_tokens = 0u64;
+    let mut total_output_tokens = 0u64;
+    let mut total_duration = 0.0f64;
+    let mut total_messages = 0u64;
+    let mut tool_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut files_touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut projects: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    for sf in &sessions {
+        projects.insert(sf.project.clone());
+        if let Some(meta) = meta_map.get(&sf.session_id) {
+            total_input_tokens += meta.input_tokens.unwrap_or(0);
+            total_output_tokens += meta.output_tokens.unwrap_or(0);
+            total_duration += meta.duration_minutes.unwrap_or(0.0);
+            total_messages += meta.user_message_count.unwrap_or(0) + meta.assistant_message_count.unwrap_or(0);
+            if let Some(ref tc) = meta.tool_counts {
+                for (tool, count) in tc {
+                    *tool_counts.entry(tool.clone()).or_default() += count;
+                }
+            }
+            if let Some(st) = meta.start_time {
+                if earliest.is_none() || st < earliest.unwrap() {
+                    earliest = Some(st);
+                }
+                if latest.is_none() || st > latest.unwrap() {
+                    latest = Some(st);
+                }
+            }
+        }
+        // Count files by parsing (only if not too many sessions)
+        if sessions.len() <= 200 {
+            let records = session::parse_session(sf);
+            for r in &records {
+                if let Some(ref fp) = r.file_path {
+                    files_touched.insert(fp.clone());
+                }
+            }
+        }
+    }
+
+    let stats = format::StatsOutput {
+        session_count: sessions.len(),
+        project_count: projects.len(),
+        message_count: total_messages,
+        input_tokens: total_input_tokens,
+        output_tokens: total_output_tokens,
+        total_duration_minutes: total_duration,
+        tool_counts,
+        files_touched: files_touched.len(),
+        earliest: earliest.map(|t| t.format("%Y-%m-%d").to_string()),
+        latest: latest.map(|t| t.format("%Y-%m-%d").to_string()),
+    };
+
+    if json_output {
+        format::print_stats_json(&stats);
+    } else {
+        format::print_stats(&stats);
     }
 }

@@ -1,0 +1,36 @@
+[package]
+name = "dex"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Search
+tantivy = "0.22"
+usearch = "2"
+
+# Embeddings
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+ndarray = "0.17"
+tokenizers = "0.19"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UX
+indicatif = "0.17"
+colored = "2"
+textwrap = "0.16"
+
+# Utilities
+directories = "5"
+uuid = { version = "1", features = ["v4"] }
+rayon = "1"
+reqwest = { version = "0.12", features = ["blocking"] }
+sha2 = "0.10"

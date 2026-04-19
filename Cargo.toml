@@ -34,3 +34,5 @@ uuid = { version = "1", features = ["v4"] }
 rayon = "1"
 reqwest = { version = "0.12", features = ["blocking"] }
 sha2 = "0.10"
+notify = "6"
+notify-debouncer-mini = "0.4"

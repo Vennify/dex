@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::parse::session::SessionFile;
+use crate::parse::DerivedMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexState {
@@ -13,12 +14,18 @@ pub struct IndexState {
     pub tantivy_doc_count: u64,
     #[serde(default)]
     pub vector_count: u64,
+    #[serde(default)]
+    pub last_index: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub size: u64,
     pub modified: DateTime<Utc>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub meta: Option<DerivedMeta>,
 }
 
 impl IndexState {
@@ -28,6 +35,7 @@ impl IndexState {
             last_full_index: None,
             tantivy_doc_count: 0,
             vector_count: 0,
+            last_index: None,
         }
     }
 
@@ -51,8 +59,8 @@ impl IndexState {
         }
     }
 
-    /// Mark a session as indexed.
-    pub fn mark_indexed(&mut self, session: &SessionFile, doc_count: u64) {
+    /// Mark a session as indexed, storing its derived meta.
+    pub fn mark_indexed(&mut self, session: &SessionFile, doc_count: u64, meta: DerivedMeta) {
         let modified = session
             .modified
             .duration_since(std::time::UNIX_EPOCH)
@@ -65,6 +73,8 @@ impl IndexState {
             SessionEntry {
                 size: session.size,
                 modified,
+                project: Some(session.project.clone()),
+                meta: Some(meta),
             },
         );
         self.tantivy_doc_count += doc_count;

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::content::extract_content_blocks;
-use super::{Record, Role};
+use super::{ContentType, DerivedMeta, ParsedSession, Record, Role};
 
 /// A discovered session file on disk.
 #[derive(Debug, Clone)]
@@ -69,20 +69,31 @@ pub fn discover_sessions(projects_dir: &Path) -> Vec<SessionFile> {
     sessions
 }
 
-/// Parse a single session JSONL file into Records.
+/// Parse a single session JSONL file into records only (legacy entry point).
 pub fn parse_session(session: &SessionFile) -> Vec<Record> {
+    parse_session_full(session).records
+}
+
+/// Parse a single session JSONL file, returning records + derived session meta.
+pub fn parse_session_full(session: &SessionFile) -> ParsedSession {
     let file = match File::open(&session.path) {
         Ok(f) => f,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            return ParsedSession {
+                records: Vec::new(),
+                meta: DerivedMeta::default(),
+            };
+        }
     };
     let reader = BufReader::new(file);
     let mut records = Vec::new();
+    let mut meta = DerivedMeta::default();
     let mut sequence: u64 = 0;
 
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue, // skip malformed lines
+            Err(_) => continue,
         };
         if line.trim().is_empty() {
             continue;
@@ -90,17 +101,10 @@ pub fn parse_session(session: &SessionFile) -> Vec<Record> {
 
         let json: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => continue, // skip unparseable lines
+            Err(_) => continue,
         };
 
         let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        // Skip types we don't index
-        match msg_type {
-            "user" | "assistant" | "system" => {}
-            _ => continue, // progress, file-history-snapshot, etc.
-        }
-
         let role = match msg_type {
             "user" => Role::User,
             "assistant" => Role::Assistant,
@@ -108,13 +112,41 @@ pub fn parse_session(session: &SessionFile) -> Vec<Record> {
             _ => continue,
         };
 
-        // Extract timestamp
         let timestamp = json
             .get("timestamp")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<DateTime<Utc>>().ok());
 
-        // Get the message content — could be at json.message.content or json.content
+        if let Some(ts) = timestamp {
+            meta.start_time = Some(meta.start_time.map_or(ts, |s| s.min(ts)));
+            meta.end_time = Some(meta.end_time.map_or(ts, |e| e.max(ts)));
+        }
+
+        if meta.cwd.is_none() {
+            if let Some(cwd) = json.get("cwd").and_then(|v| v.as_str()) {
+                meta.cwd = Some(cwd.to_string());
+            }
+        }
+
+        // Per-role counters
+        match role {
+            Role::User => meta.user_message_count += 1,
+            Role::Assistant => meta.assistant_message_count += 1,
+            Role::System => {}
+        }
+
+        // Assistant-side token usage lives in message.usage
+        if role == Role::Assistant {
+            if let Some(usage) = json.get("message").and_then(|m| m.get("usage")) {
+                if let Some(n) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                    meta.input_tokens += n;
+                }
+                if let Some(n) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                    meta.output_tokens += n;
+                }
+            }
+        }
+
         let content_value = json
             .get("message")
             .and_then(|m| m.get("content"))
@@ -128,6 +160,27 @@ pub fn parse_session(session: &SessionFile) -> Vec<Record> {
         let blocks = extract_content_blocks(role, content_value);
 
         for (i, block) in blocks.into_iter().enumerate() {
+            // First-prompt: first non-empty user text block
+            if meta.first_prompt.is_none()
+                && role == Role::User
+                && block.content_type == ContentType::Text
+                && !block.content.trim().is_empty()
+            {
+                meta.first_prompt = Some(first_line(&block.content, 240));
+            }
+
+            // Tool counts
+            if block.content_type == ContentType::ToolUse {
+                if let Some(ref name) = block.tool_name {
+                    *meta.tool_counts.entry(name.clone()).or_default() += 1;
+                    if matches!(name.as_str(), "Edit" | "Write") {
+                        if let Some(ref fp) = block.file_path {
+                            meta.files_modified.insert(fp.clone());
+                        }
+                    }
+                }
+            }
+
             let message_id = format!("{}-{}-{}", session.session_id, sequence, i);
             records.push(Record {
                 session_id: session.session_id.clone(),
@@ -147,5 +200,15 @@ pub fn parse_session(session: &SessionFile) -> Vec<Record> {
         sequence += 1;
     }
 
-    records
+    ParsedSession { records, meta }
+}
+
+fn first_line(s: &str, max_chars: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    let truncated: String = line.chars().take(max_chars).collect();
+    if line.chars().count() > max_chars {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }

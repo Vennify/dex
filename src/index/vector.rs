@@ -62,7 +62,12 @@ impl VectorStore {
             Vec::new()
         };
 
-        let next_key = index.size() as u64;
+        // `index.size()` counts live vectors only; after a `remove_session`
+        // that number drops but the keys already handed out stay reserved
+        // (usearch forbids re-using removed keys). The meta vec is appended
+        // at the key's index during `add`, so its length is authoritatively
+        // max_key + 1 — the correct next-key source.
+        let next_key = meta.len() as u64;
 
         Ok(VectorStore {
             index,

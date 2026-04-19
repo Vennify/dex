@@ -1,17 +1,5 @@
-# dex — Claude Code Conversation Indexer
-
-Local-first CLI tool for indexing, searching, and querying Claude Code conversation history. Combines Tantivy full-text search with local semantic embeddings for hybrid retrieval across thousands of sessions.
-
-## Problem
-
-Claude Code stores conversations as JSONL files in `~/.claude/projects/`. Power users accumulate hundreds of sessions totaling gigabytes. Finding "that conversation where I debugged X" requires manually opening files and scanning. There's no search, no filtering, no way to query by tool type or file touched.
-
-## Data Source
-
-All data lives under `~/.claude/`:
-
-```
-~/.claude/
+# dex — Claude Code Conversation
+```a~/.claude/
 ├── projects/
 │   └── <project-path>/          # e.g. -home-user-myproject
 │       ├── <uuid>.jsonl         # conversation messages (one per session)
@@ -21,9 +9,7 @@ All data lives under `~/.claude/`:
 │       └── <uuid>.json          # session metadata (timestamps, token counts, first prompt)
 └── history.jsonl                # global prompt history (user messages with project + timestamp)
 ```
-
 ### JSONL Message Types
-
 Each line in a session JSONL is one of:
 
 | `type` | Description |
@@ -44,6 +30,7 @@ Each line in a session JSONL is one of:
 | `tool_result` | Tool output: `{tool_use_id, content}` |
 
 ### Tool Call Structure
+
 
 ```json
 {
@@ -428,3 +415,4 @@ At this point `dex` is usable for exact text search and structured queries.
 - **TUI**: Interactive browser with fuzzy search (ratatui)
 - **Wigwam integration**: Feed dex results into Wigwam's blame/attribution system
 - **Multi-machine**: Sync indexes across machines via Wigwam relay
+

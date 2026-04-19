@@ -1,5 +1,5 @@
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::*;
 use tantivy::{Index, TantivyDocument};
 
@@ -20,7 +20,8 @@ pub struct SearchResult {
     pub sequence: u64,
 }
 
-/// Run a full-text search with optional filters.
+/// Run a full-text search with optional filters. `query_str` may be empty when
+/// filters alone are enough (e.g. `--tool Edit --file foo.rs`).
 pub fn search(
     index: &Index,
     schema: &Schema,
@@ -35,13 +36,17 @@ pub fn search(
     let file_path_field = schema.get_field("file_path").unwrap();
     let command_field = schema.get_field("command").unwrap();
 
-    // Build the text query across content, file_path, and command fields
-    let query_parser = QueryParser::for_index(index, vec![content_field, file_path_field, command_field]);
-    let text_query = query_parser.parse_query(query_str)?;
-
-    // Build filter clauses
     let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
-    clauses.push((Occur::Must, text_query));
+
+    let trimmed = query_str.trim();
+    if trimmed.is_empty() {
+        clauses.push((Occur::Must, Box::new(AllQuery)));
+    } else {
+        let query_parser =
+            QueryParser::for_index(index, vec![content_field, file_path_field, command_field]);
+        let text_query = query_parser.parse_query(trimmed)?;
+        clauses.push((Occur::Must, text_query));
+    }
 
     if let Some(ref role) = filters.role {
         let field = schema.get_field("role").unwrap();
@@ -55,11 +60,25 @@ pub fn search(
         clauses.push((Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic))));
     }
 
-    if let Some(ref project) = filters.project {
+    if !filters.project_dirs.is_empty() {
         let field = schema.get_field("project").unwrap();
-        // Try both the raw project name and with path prefix
-        let term = tantivy::Term::from_field_text(field, project);
-        clauses.push((Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic))));
+        if filters.project_dirs.len() == 1 {
+            let term = tantivy::Term::from_field_text(field, &filters.project_dirs[0]);
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            ));
+        } else {
+            let mut project_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+            for dir in &filters.project_dirs {
+                let term = tantivy::Term::from_field_text(field, dir);
+                project_clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                ));
+            }
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(project_clauses))));
+        }
     }
 
     if let Some(ref ct) = filters.content_type {
@@ -68,9 +87,20 @@ pub fn search(
         clauses.push((Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic))));
     }
 
-    // Date range filters — tantivy 0.22 RangeQuery::new_date needs a full Range<DateTime>
+    if let Some(ref file_substr) = filters.file_path {
+        // file_path is a TEXT field (tokenized), so a QueryParser phrase handles substrings
+        // of path components. Accept both literal and tokenized matches.
+        let parser = QueryParser::for_index(index, vec![file_path_field]);
+        let quoted = format!("\"{}\"", file_substr.replace('"', ""));
+        if let Ok(q) = parser.parse_query(&quoted) {
+            clauses.push((Occur::Must, q));
+        } else if let Ok(q) = parser.parse_query(file_substr) {
+            clauses.push((Occur::Must, q));
+        }
+    }
+
     let far_past = tantivy::DateTime::from_timestamp_secs(0);
-    let far_future = tantivy::DateTime::from_timestamp_secs(4102444800); // 2100-01-01
+    let far_future = tantivy::DateTime::from_timestamp_secs(4102444800);
 
     if filters.after.is_some() || filters.before.is_some() {
         let start = filters

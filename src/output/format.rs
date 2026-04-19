@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 
-use crate::parse::metadata::SessionMeta;
 use crate::parse::session::{self, SessionFile};
 use crate::query::text::SearchResult;
 
@@ -41,7 +40,7 @@ fn print_single_result(i: usize, result: &SearchResult) {
     println!(
         "  {} {} {}",
         "session:".dimmed(),
-        &result.session_id[..8.min(result.session_id.len())],
+        &result.session_id,
         format!("({})", result.project).dimmed(),
     );
 
@@ -164,28 +163,28 @@ pub fn print_session_list(sessions: &[SessionListItem]) {
             .take(80)
             .collect::<String>();
 
+        let indexed_marker = if session.indexed { "" } else { " (not indexed)" };
         println!(
-            "{}  {}  {}",
-            session.session_id[..8.min(session.session_id.len())].bold(),
+            "{}  {}{}  {}",
+            session.session_id.bold(),
             time_str.dimmed(),
+            indexed_marker.yellow(),
             format!("({})", session.project).dimmed(),
         );
         println!("  {}", prompt_preview);
 
-        if let Some(ref meta) = session.meta {
-            let mut stats = Vec::new();
-            if let Some(d) = meta.duration_minutes {
-                stats.push(format!("{:.0}min", d));
-            }
-            if let Some(t) = meta.input_tokens {
-                stats.push(format!("{}tok in", t));
-            }
-            if let Some(t) = meta.output_tokens {
-                stats.push(format!("{}tok out", t));
-            }
-            if !stats.is_empty() {
-                println!("  {}", stats.join(" | ").dimmed());
-            }
+        let mut stats = Vec::new();
+        if let Some(d) = session.duration_minutes {
+            stats.push(format!("{:.0}min", d));
+        }
+        if let Some(t) = session.input_tokens {
+            stats.push(format!("{}tok in", t));
+        }
+        if let Some(t) = session.output_tokens {
+            stats.push(format!("{}tok out", t));
+        }
+        if !stats.is_empty() {
+            println!("  {}", stats.join(" | ").dimmed());
         }
         println!();
     }
@@ -197,7 +196,10 @@ pub struct SessionListItem {
     pub project: String,
     pub start_time: Option<String>,
     pub first_prompt: Option<String>,
-    pub meta: Option<SessionMeta>,
+    pub duration_minutes: Option<f64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub indexed: bool,
 }
 
 /// Format and print a full session conversation.
@@ -276,6 +278,41 @@ pub enum ShowFilter {
     Commands,
 }
 
+pub fn print_session_show_json(records: &[crate::parse::Record], show_filter: ShowFilter) {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for record in records {
+        let include = match show_filter {
+            ShowFilter::All => true,
+            ShowFilter::User => record.role == crate::parse::Role::User,
+            ShowFilter::Assistant => {
+                record.role == crate::parse::Role::Assistant
+                    && record.content_type == crate::parse::ContentType::Text
+            }
+            ShowFilter::Tools => record.content_type == crate::parse::ContentType::ToolUse,
+            ShowFilter::Edits => record.tool_name.as_deref() == Some("Edit"),
+            ShowFilter::Files => record.file_path.is_some(),
+            ShowFilter::Commands => record.command.is_some(),
+        };
+        if !include {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "session_id": record.session_id,
+            "message_id": record.message_id,
+            "project": record.project,
+            "role": record.role.as_str(),
+            "content_type": record.content_type.as_str(),
+            "tool_name": record.tool_name,
+            "file_path": record.file_path,
+            "command": record.command,
+            "content": record.content,
+            "timestamp": record.timestamp.map(|t| t.to_rfc3339()),
+            "sequence": record.sequence,
+        }));
+    }
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
 // --- File history ---
 
 pub struct FileHistoryItem {
@@ -303,7 +340,7 @@ pub fn print_file_history(items: &[FileHistoryItem]) {
 
         println!(
             "{}  {}  {}  {}",
-            &item.session_id[..8.min(item.session_id.len())].bold(),
+            item.session_id.bold(),
             item.tool_name.cyan(),
             time_str.dimmed(),
             format!("({})", item.project).dimmed(),
@@ -345,11 +382,19 @@ pub struct StatsOutput {
     pub files_touched: usize,
     pub earliest: Option<String>,
     pub latest: Option<String>,
+    pub unindexed_sessions: usize,
 }
 
 pub fn print_stats(stats: &StatsOutput) {
     println!("{}", "dex stats".bold());
     println!("  Sessions:       {}", stats.session_count);
+    if stats.unindexed_sessions > 0 {
+        println!(
+            "  {}   {} (run `dex index` to include)",
+            "Unindexed:".yellow(),
+            stats.unindexed_sessions
+        );
+    }
     println!("  Projects:       {}", stats.project_count);
     println!("  Messages:       {}", stats.message_count);
     println!("  Input tokens:   {}", format_number(stats.input_tokens));
@@ -386,6 +431,7 @@ pub fn print_stats_json(stats: &StatsOutput) {
         "files_touched": stats.files_touched,
         "earliest": stats.earliest,
         "latest": stats.latest,
+        "unindexed_sessions": stats.unindexed_sessions,
     });
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }

@@ -412,9 +412,14 @@ fn cmd_index(
     };
 
     if status {
+        // Trust the on-disk usearch count over the cached state.vector_count,
+        // which can be stale after a force-full rebuild with --no-embed.
+        let live_vectors = VectorStore::open(&config.data_dir)
+            .map(|s| s.len() as u64)
+            .unwrap_or(state.vector_count);
         println!("Indexed sessions: {}", state.indexed_sessions.len());
         println!("Total documents:  {}", state.tantivy_doc_count);
-        println!("Total vectors:    {}", state.vector_count);
+        println!("Total vectors:    {}", live_vectors);
         if let Some(ref last) = state.last_index {
             println!("Last index run:   {}", last.format("%Y-%m-%d %H:%M:%S UTC"));
         }
@@ -592,9 +597,63 @@ fn cmd_index(
             }
         }
 
-        state.mark_indexed(session_file, count, parsed.meta);
+        state.mark_indexed(
+            session_file,
+            count,
+            parsed.meta,
+            embedder_and_store.is_some(),
+        );
         total_docs += count;
         pb.inc(1);
+    }
+
+    // Embed-only pass: sessions already text-indexed but without vectors.
+    if let Some((ref mut embedder, ref mut store)) = embedder_and_store {
+        let to_embed: Vec<_> = sessions
+            .iter()
+            .filter(|s| state.needs_embedding(s))
+            .filter(|s| !to_index.iter().any(|x| x.session_id == s.session_id))
+            .collect();
+        if !to_embed.is_empty() {
+            eprintln!(
+                "Embedding {} previously text-indexed session(s)...",
+                to_embed.len()
+            );
+            let pb2 = ProgressBar::new(to_embed.len() as u64);
+            pb2.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} embed ({eta})")
+                    .unwrap()
+                    .progress_chars("=>-"),
+            );
+            for session_file in &to_embed {
+                store.remove_session(&session_file.session_id);
+                let parsed = session::parse_session_full(session_file);
+                let embeddable: Vec<_> =
+                    parsed.records.iter().filter(|r| should_embed(r)).collect();
+                let mut session_vectors = 0u64;
+                for record in &embeddable {
+                    if let Ok(chunks) = embedder.embed_chunked(&record.content) {
+                        for (chunk, embedding) in chunks {
+                            let meta = VectorMeta {
+                                session_id: record.session_id.clone(),
+                                message_id: record.message_id.clone(),
+                                chunk_index: chunk.index,
+                            };
+                            if store.add(&embedding, meta).is_ok() {
+                                session_vectors += 1;
+                            }
+                        }
+                    }
+                }
+                total_vectors += session_vectors;
+                if let Some(entry) = state.indexed_sessions.get_mut(&session_file.session_id) {
+                    entry.embedded = true;
+                }
+                pb2.inc(1);
+            }
+            pb2.finish_and_clear();
+        }
     }
 
     if !to_backfill.is_empty() {
@@ -840,6 +899,33 @@ fn lookup_by_message_id(
     })
 }
 
+/// Resolve a session-id prefix, accommodating the two stem shapes dex
+/// uses: bare UUIDs (regular/teammate sessions) and `agent-<agentId>`
+/// for subagents. User-typed short prefixes like `a81eeb0d` should match
+/// both without forcing the user to remember the `agent-` prefix.
+fn resolve_session_prefix<'a>(
+    all: &'a [session::SessionFile],
+    prefix: &str,
+) -> Vec<&'a session::SessionFile> {
+    let mut exact: Vec<&session::SessionFile> = all
+        .iter()
+        .filter(|s| s.session_id.starts_with(prefix))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let agent_form = format!("agent-{prefix}");
+    exact = all
+        .iter()
+        .filter(|s| s.session_id.starts_with(&agent_form))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    // Last-ditch substring match (useful for tail-end hex fragments).
+    all.iter().filter(|s| s.session_id.contains(prefix)).collect()
+}
+
 /// Resolve a `--project` hint (substring) to the set of project directory
 /// names that match. Returns empty if no hint; returns empty + caller should
 /// error if hint given but no match.
@@ -981,10 +1067,8 @@ fn cmd_tree(config: &Config, session_id_prefix: &str) {
     let state = IndexState::load(&config.state_file);
     let all_sessions = session::discover_sessions(&config.claude_projects_dir);
 
-    let matching: Vec<&session::SessionFile> = all_sessions
-        .iter()
-        .filter(|s| s.session_id.starts_with(session_id_prefix))
-        .collect();
+    let matching: Vec<&session::SessionFile> =
+        resolve_session_prefix(&all_sessions, session_id_prefix);
     let sf = match matching.len() {
         0 => {
             eprintln!("No session found matching '{session_id_prefix}'");
@@ -1170,10 +1254,7 @@ fn cmd_show(
 ) {
     let all_sessions = session::discover_sessions(&config.claude_projects_dir);
 
-    let matching: Vec<_> = all_sessions
-        .iter()
-        .filter(|s| s.session_id.starts_with(session_id_prefix))
-        .collect();
+    let matching: Vec<_> = resolve_session_prefix(&all_sessions, session_id_prefix);
 
     match matching.len() {
         0 => {

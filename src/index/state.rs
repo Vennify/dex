@@ -32,6 +32,11 @@ pub struct SessionEntry {
     pub project: Option<String>,
     #[serde(default)]
     pub meta: Option<DerivedMeta>,
+    /// Whether embeddings were generated for this session. A `--no-embed`
+    /// run leaves this false so a later embedding pass can fill them in
+    /// without a full reindex.
+    #[serde(default)]
+    pub embedded: bool,
 }
 
 impl IndexState {
@@ -67,7 +72,13 @@ impl IndexState {
     }
 
     /// Mark a session as indexed, storing its derived meta.
-    pub fn mark_indexed(&mut self, session: &SessionFile, doc_count: u64, meta: DerivedMeta) {
+    pub fn mark_indexed(
+        &mut self,
+        session: &SessionFile,
+        doc_count: u64,
+        meta: DerivedMeta,
+        embedded: bool,
+    ) {
         let modified = session
             .modified
             .duration_since(std::time::UNIX_EPOCH)
@@ -82,8 +93,18 @@ impl IndexState {
                 modified,
                 project: Some(session.project.clone()),
                 meta: Some(meta),
+                embedded,
             },
         );
         self.tantivy_doc_count += doc_count;
+    }
+
+    /// True if this session's JSONL has been text-indexed but is missing
+    /// vector embeddings (e.g. indexed under `--no-embed`).
+    pub fn needs_embedding(&self, session: &SessionFile) -> bool {
+        match self.indexed_sessions.get(&session.session_id) {
+            Some(entry) if entry.size == session.size => !entry.embedded,
+            _ => false,
+        }
     }
 }

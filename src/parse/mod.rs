@@ -73,6 +73,40 @@ impl std::fmt::Display for ContentType {
     }
 }
 
+/// What sort of Claude Code session this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    #[default]
+    Regular,
+    /// Native Claude Code subagent (spawned via Agent tool, isSidechain=true).
+    /// Lives under `<parent>/subagents/agent-<agentId>.jsonl`.
+    Subagent,
+    /// Wigwam-orchestrated teammate (spawned via Agent tool with
+    /// `team_name` in input, runs in a parallel Claude Code session).
+    /// Has its own top-level JSONL with `teamName` / `agentName` fields.
+    Teammate,
+}
+
+impl SessionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionKind::Regular => "regular",
+            SessionKind::Subagent => "subagent",
+            SessionKind::Teammate => "teammate",
+        }
+    }
+}
+
+/// A teammate-member reference emitted by a team-lead when it calls
+/// Agent{team_name:..., name:...}. Captured during parse so we can later
+/// resolve teammate → team-lead links.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMemberRef {
+    pub team_name: String,
+    pub agent_name: String,
+}
+
 /// Session-level metadata derived directly from the JSONL. Replaces the
 /// now-defunct session-meta JSON cache (Claude Code stopped writing those
 /// on 2026-03-22), while remaining compatible with older sessions.
@@ -89,6 +123,33 @@ pub struct DerivedMeta {
     pub files_modified: HashSet<String>,
     /// The working directory stamped on user messages (first seen).
     pub cwd: Option<String>,
+
+    // Session-kind fields ------------------------------------------------
+    #[serde(default)]
+    pub kind: SessionKind,
+    /// Native subagent id (e.g. "a1ec0f8ce3cedb281"). Subagents only.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Subagent type from sibling meta.json (e.g. "Explore"). Subagents only.
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    /// Subagent's parent session UUID (the dir name). Subagents only.
+    #[serde(default)]
+    pub parent_session_uuid: Option<String>,
+    /// Wigwam team name. Teammates only.
+    #[serde(default)]
+    pub team_name: Option<String>,
+    /// Teammate agent name (e.g. "p1-migration"). Teammates only.
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// Team-lead session id, resolved post-index via team-member map.
+    /// Teammates only.
+    #[serde(default)]
+    pub team_lead_session_id: Option<String>,
+    /// Teammates this session spawned (via Agent{team_name:...}).
+    /// Regular sessions acting as team-leads populate this.
+    #[serde(default)]
+    pub team_members_spawned: Vec<TeamMemberRef>,
 }
 
 impl DerivedMeta {

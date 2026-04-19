@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::parse::session::SessionFile;
 use crate::parse::DerivedMeta;
 
+/// Bump whenever the tantivy schema or on-disk derived-meta layout
+/// changes in an incompatible way. Mismatch triggers a full reindex.
+pub const SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexState {
     pub indexed_sessions: HashMap<String, SessionEntry>,
@@ -16,6 +20,8 @@ pub struct IndexState {
     pub vector_count: u64,
     #[serde(default)]
     pub last_index: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +42,7 @@ impl IndexState {
             tantivy_doc_count: 0,
             vector_count: 0,
             last_index: None,
+            schema_version: SCHEMA_VERSION,
         }
     }
 

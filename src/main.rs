@@ -107,9 +107,23 @@ enum Commands {
         /// Sort by: time (default), tokens, duration
         #[arg(long, default_value = "time")]
         sort: String,
+        /// Filter by session kind: regular, subagent, teammate
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by subagent type (e.g. Explore, Plan)
+        #[arg(long)]
+        agent_type: Option<String>,
+        /// Filter by wigwam team name
+        #[arg(long)]
+        team: Option<String>,
     },
     /// List indexed projects with session counts
     Projects,
+    /// Show the parent/child relationships for a session (team / subagents).
+    Tree {
+        /// Session ID (prefix match)
+        session_id: String,
+    },
     /// Show a session's conversation
     #[command(alias = "edits")]
     Show {
@@ -288,11 +302,25 @@ fn main() {
             project,
             after,
             sort,
+            kind,
+            agent_type,
+            team,
         } => {
-            cmd_sessions(&config, project.as_deref(), after.as_deref(), &sort);
+            cmd_sessions(
+                &config,
+                project.as_deref(),
+                after.as_deref(),
+                &sort,
+                kind.as_deref(),
+                agent_type.as_deref(),
+                team.as_deref(),
+            );
         }
         Commands::Projects => {
             cmd_projects(&config);
+        }
+        Commands::Tree { session_id } => {
+            cmd_tree(&config, &session_id);
         }
         Commands::Show {
             session_id,
@@ -368,10 +396,19 @@ fn cmd_index(
         std::process::exit(1);
     }
 
-    let mut state = if full {
+    let loaded = IndexState::load(&config.state_file);
+    let force_full = full || loaded.schema_version != index::state::SCHEMA_VERSION;
+    if force_full && !full {
+        eprintln!(
+            "Schema version changed (state v{} → code v{}); running full reindex.",
+            loaded.schema_version,
+            index::state::SCHEMA_VERSION
+        );
+    }
+    let mut state = if force_full {
         IndexState::new()
     } else {
-        IndexState::load(&config.state_file)
+        loaded
     };
 
     if status {
@@ -408,7 +445,7 @@ fn cmd_index(
 
     let to_index: Vec<_> = sessions
         .iter()
-        .filter(|s| full || state.needs_indexing(s))
+        .filter(|s| force_full || state.needs_indexing(s))
         .collect();
 
     // Meta backfill: sessions already indexed (tantivy) but missing derived meta.
@@ -497,7 +534,7 @@ fn cmd_index(
 
         let parsed = session::parse_session_full(session_file);
 
-        let count = match tantivy_index::index_records(&writer, &schema, &parsed.records) {
+        let count = match tantivy_index::index_records(&writer, &schema, &parsed.records, &parsed.meta) {
             Ok(c) => c,
             Err(e) => {
                 pb.println(format!(
@@ -587,6 +624,8 @@ fn cmd_index(
         state.vector_count = store.len() as u64;
     }
 
+    resolve_team_links(&mut state);
+
     state.last_index = Some(chrono::Utc::now());
     if full {
         state.last_full_index = state.last_index;
@@ -606,6 +645,45 @@ fn cmd_index(
         state.indexed_sessions.len(),
         state.vector_count,
     );
+}
+
+/// Post-index resolution: walk the state, collect the
+/// (team_name, agent_name) → session_id map from team-leads'
+/// `team_members_spawned`, then populate each teammate session's
+/// `team_lead_session_id`.
+fn resolve_team_links(state: &mut IndexState) {
+    let mut map: HashMap<(String, String), String> = HashMap::new();
+    for (sid, entry) in state.indexed_sessions.iter() {
+        if let Some(meta) = &entry.meta {
+            for mref in &meta.team_members_spawned {
+                map.entry((mref.team_name.clone(), mref.agent_name.clone()))
+                    .or_insert_with(|| sid.clone());
+            }
+        }
+    }
+    if map.is_empty() {
+        return;
+    }
+    for (_sid, entry) in state.indexed_sessions.iter_mut() {
+        let Some(meta) = entry.meta.as_mut() else {
+            continue;
+        };
+        if meta.kind != parse::SessionKind::Teammate {
+            continue;
+        }
+        let Some(team) = meta.team_name.clone() else {
+            continue;
+        };
+        let Some(agent) = meta.agent_name.clone() else {
+            continue;
+        };
+        if meta.team_lead_session_id.is_some() {
+            continue;
+        }
+        if let Some(lead) = map.get(&(team, agent)) {
+            meta.team_lead_session_id = Some(lead.clone());
+        }
+    }
 }
 
 fn should_embed(record: &parse::Record) -> bool {
@@ -779,7 +857,15 @@ fn resolve_project_dirs(all_sessions: &[SessionFile], hint: Option<&str>) -> Vec
     out
 }
 
-fn cmd_sessions(config: &Config, project_filter: Option<&str>, after: Option<&str>, sort: &str) {
+fn cmd_sessions(
+    config: &Config,
+    project_filter: Option<&str>,
+    after: Option<&str>,
+    sort: &str,
+    kind_filter: Option<&str>,
+    agent_type_filter: Option<&str>,
+    team_filter: Option<&str>,
+) {
     let state = IndexState::load(&config.state_file);
     let all_sessions = session::discover_sessions(&config.claude_projects_dir);
     let meta_map = metadata::load_all_session_meta(&config.claude_session_meta_dir);
@@ -792,9 +878,24 @@ fn cmd_sessions(config: &Config, project_filter: Option<&str>, after: Option<&st
             Some(pf) => s.project.contains(pf),
             None => true,
         })
+        .filter(|s| match kind_filter {
+            Some(k) => s.kind.as_str() == k.to_lowercase(),
+            None => true,
+        })
+        .filter(|s| match agent_type_filter {
+            Some(t) => s.agent_type.as_deref() == Some(t),
+            None => true,
+        })
         .filter_map(|s| {
             let derived = state.indexed_sessions.get(&s.session_id).and_then(|e| e.meta.clone());
             let legacy_meta = meta_map.get(&s.session_id).cloned();
+
+            if let Some(t) = team_filter {
+                let team = derived.as_ref().and_then(|d| d.team_name.clone());
+                if team.as_deref() != Some(t) {
+                    return None;
+                }
+            }
 
             let start_time = derived
                 .as_ref()
@@ -838,6 +939,11 @@ fn cmd_sessions(config: &Config, project_filter: Option<&str>, after: Option<&st
                     .map(|d| d.output_tokens)
                     .or_else(|| legacy_meta.as_ref().and_then(|m| m.output_tokens)),
                 indexed: derived.is_some(),
+                kind: s.kind,
+                agent_type: derived.as_ref().and_then(|d| d.agent_type.clone()).or(s.agent_type.clone()),
+                team_name: derived.as_ref().and_then(|d| d.team_name.clone()),
+                agent_name: derived.as_ref().and_then(|d| d.agent_name.clone()),
+                parent_session_uuid: s.parent_session_uuid.clone(),
             })
         })
         .collect();
@@ -867,6 +973,169 @@ fn cmd_sessions(config: &Config, project_filter: Option<&str>, after: Option<&st
     }
 
     format::print_session_list(&items);
+}
+
+fn cmd_tree(config: &Config, session_id_prefix: &str) {
+    use colored::Colorize;
+
+    let state = IndexState::load(&config.state_file);
+    let all_sessions = session::discover_sessions(&config.claude_projects_dir);
+
+    let matching: Vec<&session::SessionFile> = all_sessions
+        .iter()
+        .filter(|s| s.session_id.starts_with(session_id_prefix))
+        .collect();
+    let sf = match matching.len() {
+        0 => {
+            eprintln!("No session found matching '{session_id_prefix}'");
+            std::process::exit(1);
+        }
+        1 => matching[0],
+        n => {
+            eprintln!("Ambiguous prefix '{session_id_prefix}' matches {n} sessions:");
+            for s in &matching[..n.min(5)] {
+                eprintln!("  {} ({})", s.session_id, s.project);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let me_meta = state
+        .indexed_sessions
+        .get(&sf.session_id)
+        .and_then(|e| e.meta.clone());
+
+    println!(
+        "{}  {}",
+        sf.session_id.bold(),
+        format!("({})", sf.project).dimmed()
+    );
+    let kind_label = match sf.kind {
+        parse::SessionKind::Regular => "regular".to_string(),
+        parse::SessionKind::Subagent => format!(
+            "subagent{}",
+            sf.agent_type
+                .as_deref()
+                .map(|t| format!(":{t}"))
+                .unwrap_or_default()
+        ),
+        parse::SessionKind::Teammate => {
+            let team = me_meta.as_ref().and_then(|m| m.team_name.clone());
+            let name = me_meta.as_ref().and_then(|m| m.agent_name.clone());
+            match (team, name) {
+                (Some(t), Some(n)) => format!("teammate:{t}/{n}"),
+                _ => "teammate".to_string(),
+            }
+        }
+    };
+    println!("  kind: {}", kind_label.cyan());
+    if let Some(m) = &me_meta {
+        if let Some(p) = &m.first_prompt {
+            let short: String = p.chars().take(140).collect();
+            println!("  first prompt: {}", short.dimmed());
+        }
+    }
+
+    // Parent
+    match sf.kind {
+        parse::SessionKind::Subagent => {
+            if let Some(parent) = sf.parent_session_uuid.as_deref() {
+                print_related(&state, "spawned by", parent);
+            }
+        }
+        parse::SessionKind::Teammate => {
+            let lead = me_meta.as_ref().and_then(|m| m.team_lead_session_id.clone());
+            if let Some(lead) = lead.as_deref() {
+                print_related(&state, "team-lead", lead);
+            } else {
+                println!("  {}", "team-lead: (not found in index — run `dex index`)".yellow());
+            }
+        }
+        parse::SessionKind::Regular => {}
+    }
+
+    // Children — subagents (by path)
+    let children_subagents: Vec<&session::SessionFile> = all_sessions
+        .iter()
+        .filter(|s| {
+            s.kind == parse::SessionKind::Subagent
+                && s.parent_session_uuid.as_deref() == Some(sf.session_id.as_str())
+        })
+        .collect();
+    if !children_subagents.is_empty() {
+        println!("\n  {}", format!("subagents ({}):", children_subagents.len()).bold());
+        for c in &children_subagents {
+            let at = c.agent_type.as_deref().unwrap_or("?");
+            let ameta = state.indexed_sessions.get(&c.session_id).and_then(|e| e.meta.as_ref());
+            let prompt = ameta
+                .and_then(|m| m.first_prompt.as_deref())
+                .unwrap_or("");
+            let preview: String = prompt.chars().take(80).collect();
+            println!(
+                "    {} [{}] {}",
+                c.session_id.dimmed(),
+                at.cyan(),
+                preview.dimmed()
+            );
+        }
+    }
+
+    // Children — teammates (via spawned map)
+    if let Some(m) = &me_meta {
+        if !m.team_members_spawned.is_empty() {
+            println!(
+                "\n  {}",
+                format!("teammates spawned ({}):", m.team_members_spawned.len()).bold()
+            );
+            // Build lookup (team_name, agent_name) -> teammate session id
+            let mut tm_lookup: HashMap<(String, String), String> = HashMap::new();
+            for (sid, entry) in state.indexed_sessions.iter() {
+                if let Some(em) = &entry.meta {
+                    if em.kind == parse::SessionKind::Teammate {
+                        if let (Some(t), Some(n)) = (&em.team_name, &em.agent_name) {
+                            tm_lookup
+                                .entry((t.clone(), n.clone()))
+                                .or_insert_with(|| sid.clone());
+                        }
+                    }
+                }
+            }
+            for tm in &m.team_members_spawned {
+                let key = (tm.team_name.clone(), tm.agent_name.clone());
+                let sid = tm_lookup
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| "(session not yet on disk)".into());
+                println!(
+                    "    [{}] {}  →  {}",
+                    tm.team_name.yellow(),
+                    tm.agent_name.cyan(),
+                    sid.dimmed()
+                );
+            }
+        }
+    }
+}
+
+fn print_related(state: &IndexState, label: &str, id: &str) {
+    use colored::Colorize;
+    let kind_line = match state.indexed_sessions.get(id).and_then(|e| e.meta.as_ref()) {
+        Some(m) => {
+            let summary = m
+                .first_prompt
+                .as_deref()
+                .map(|p| p.chars().take(100).collect::<String>())
+                .unwrap_or_default();
+            format!("  {}: {}  {}", label, id.bold(), summary.dimmed())
+        }
+        None => format!(
+            "  {}: {}  {}",
+            label,
+            id.bold(),
+            "(not indexed)".yellow()
+        ),
+    };
+    println!("{kind_line}");
 }
 
 fn cmd_projects(config: &Config) {

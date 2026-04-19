@@ -164,13 +164,29 @@ pub fn print_session_list(sessions: &[SessionListItem]) {
             .collect::<String>();
 
         let indexed_marker = if session.indexed { "" } else { " (not indexed)" };
+        let kind_tag = match session.kind {
+            crate::parse::SessionKind::Regular => String::new(),
+            crate::parse::SessionKind::Subagent => {
+                let at = session.agent_type.as_deref().unwrap_or("?");
+                format!(" [subagent:{at}]")
+            }
+            crate::parse::SessionKind::Teammate => {
+                let t = session.team_name.as_deref().unwrap_or("?");
+                let n = session.agent_name.as_deref().unwrap_or("?");
+                format!(" [teammate:{t}/{n}]")
+            }
+        };
         println!(
-            "{}  {}{}  {}",
+            "{}  {}{}{}  {}",
             session.session_id.bold(),
             time_str.dimmed(),
             indexed_marker.yellow(),
+            kind_tag.magenta(),
             format!("({})", session.project).dimmed(),
         );
+        if let Some(p) = &session.parent_session_uuid {
+            println!("  {} {}", "parent:".dimmed(), p.dimmed());
+        }
         println!("  {}", prompt_preview);
 
         let mut stats = Vec::new();
@@ -200,6 +216,11 @@ pub struct SessionListItem {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub indexed: bool,
+    pub kind: crate::parse::SessionKind,
+    pub agent_type: Option<String>,
+    pub team_name: Option<String>,
+    pub agent_name: Option<String>,
+    pub parent_session_uuid: Option<String>,
 }
 
 /// Format and print a full session conversation.

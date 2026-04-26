@@ -1,0 +1,58 @@
+# Wigwam sync ignore patterns
+#
+# The patterns below are also built into Wigwam — they will be ignored even
+# if this file is deleted. To sync one of them anyway, add a line like:
+#   !Cargo.lock
+#
+# Add your own patterns below (standard gitignore syntax).
+
+# Wigwam's own per-project state (alt-branch local dirs, etc.)
+.wigwam/
+
+# Lockfiles
+Cargo.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lock
+bun.lockb
+Gemfile.lock
+composer.lock
+poetry.lock
+Pipfile.lock
+go.sum
+flake.lock
+pubspec.lock
+
+# Build / dependency dirs
+# `/build/` and `/dist/` are anchored so package namespaces like
+# `kotlin/build/foo/` aren't accidentally ignored.
+node_modules/
+target/
+/build/
+/dist/
+.dart_tool/
+.svelte-kit/
+.next/
+.nuxt/
+.turbo/
+.cache/
+.vite/
+__pycache__/
+.venv/
+venv/
+vendor/
+
+# OS / tool cruft
+.DS_Store
+Thumbs.db
+*.snap.new
+
+# Binary blobs
+*.onnx
+*.pt
+*.safetensors
+*.tflite
+*.h5
+*.ckpt
+*.pb
